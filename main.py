@@ -6,7 +6,7 @@ import base64
 from PIL import Image
 import io
 import re
-from anthropic import Anthropic, APIStatusError, APIError
+from openai import OpenAI
 import difflib
 import time
 from rich.console import Console
@@ -31,13 +31,13 @@ def setup_virtual_environment() -> Tuple[str, str]:
     try:
         if not os.path.exists(venv_path):
             venv.create(venv_path, with_pip=True)
-        
+
         # Activate the virtual environment
         if sys.platform == "win32":
             activate_script = os.path.join(venv_path, "Scripts", "activate.bat")
         else:
             activate_script = os.path.join(venv_path, "bin", "activate")
-        
+
         return venv_path, activate_script
     except Exception as e:
         logging.error(f"Error setting up virtual environment: {str(e)}")
@@ -47,11 +47,15 @@ def setup_virtual_environment() -> Tuple[str, str]:
 # Load environment variables from .env file
 load_dotenv()
 
-# Initialize the Anthropic client
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-if not anthropic_api_key:
+# Initialize the OpenAI client (using Anthropic's API)
+openai_api_key = os.getenv("ANTHROPIC_API_KEY")
+if not openai_api_key:
     raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
-client = Anthropic(api_key=anthropic_api_key)
+openai_base_url = os.getenv("ANTHROPIC_BASE_URL")
+if openai_base_url:
+    client = OpenAI(api_key=openai_api_key, base_url=openai_base_url)
+else:
+    client = OpenAI(api_key=openai_api_key)
 
 # Initialize the Tavily client
 tavily_api_key = os.getenv("TAVILY_API_KEY")
@@ -60,7 +64,6 @@ if not tavily_api_key:
 tavily = TavilyClient(api_key=tavily_api_key)
 
 console = Console()
-
 
 # Token tracking variables
 main_model_tokens = {'input': 0, 'output': 0}
@@ -206,18 +209,20 @@ def update_system_prompt(current_iteration: Optional[int] = None, max_iterations
 
     Do not reflect on the quality of the returned search results in your response.
     """
-    
+
     file_contents_prompt = "\n\nFile Contents:\n"
     for path, content in file_contents.items():
         file_contents_prompt += f"\n--- {path} ---\n{content}\n"
-    
+
     if automode:
         iteration_info = ""
         if current_iteration is not None and max_iterations is not None:
             iteration_info = f"You are currently on iteration {current_iteration} out of {max_iterations} in automode."
-        return BASE_SYSTEM_PROMPT + file_contents_prompt + "\n\n" + AUTOMODE_SYSTEM_PROMPT.format(iteration_info=iteration_info) + "\n\n" + chain_of_thought_prompt
+        return BASE_SYSTEM_PROMPT + file_contents_prompt + "\n\n" + AUTOMODE_SYSTEM_PROMPT.format(
+            iteration_info=iteration_info) + "\n\n" + chain_of_thought_prompt
     else:
         return BASE_SYSTEM_PROMPT + file_contents_prompt + "\n\n" + chain_of_thought_prompt
+
 
 def create_folder(path):
     try:
@@ -225,6 +230,7 @@ def create_folder(path):
         return f"Folder created: {path}"
     except Exception as e:
         return f"Error creating folder: {str(e)}"
+
 
 def create_file(path, content=""):
     global file_contents
@@ -236,8 +242,10 @@ def create_file(path, content=""):
     except Exception as e:
         return f"Error creating file: {str(e)}"
 
+
 def highlight_diff(diff_text):
     return Syntax(diff_text, "diff", theme="monokai", line_numbers=True)
+
 
 def generate_and_apply_diff(original_content, new_content, path):
     diff = list(difflib.unified_diff(
@@ -290,7 +298,7 @@ async def generate_edit_instructions(file_content, instructions, project_context
     global code_editor_tokens, code_editor_memory
     try:
         # Prepare memory context (this is the only part that maintains some context between calls)
-        memory_context = "\n".join([f"Memory {i+1}:\n{mem}" for i, mem in enumerate(code_editor_memory)])
+        memory_context = "\n".join([f"Memory {i + 1}:\n{mem}" for i, mem in enumerate(code_editor_memory)])
 
         system_prompt = f"""
         You are an AI coding agent that generates edit instructions for code files. Your task is to analyze the provided code and generate SEARCH/REPLACE blocks for necessary changes. Follow these steps:
@@ -333,21 +341,20 @@ async def generate_edit_instructions(file_content, instructions, project_context
         """
 
         # Make the API call to CODEEDITORMODEL (context is not maintained except for code_editor_memory)
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=CODEEDITORMODEL,
             max_tokens=8000,
-            system=system_prompt,
-            extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
             messages=[
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": "Generate SEARCH/REPLACE blocks for the necessary changes."}
             ]
         )
         # Update token usage for code editor
-        code_editor_tokens['input'] += response.usage.input_tokens
-        code_editor_tokens['output'] += response.usage.output_tokens
+        code_editor_tokens['input'] += response.usage.prompt_tokens
+        code_editor_tokens['output'] += response.usage.completion_tokens
 
         # Parse the response to extract SEARCH/REPLACE blocks
-        edit_instructions = parse_search_replace_blocks(response.content[0].text)
+        edit_instructions = parse_search_replace_blocks(response.choices[0].message.content)
 
         # Update code editor memory (this is the only part that maintains some context between calls)
         code_editor_memory.append(f"Edit Instructions:\n{response.content[0].text}")
@@ -357,7 +364,6 @@ async def generate_edit_instructions(file_content, instructions, project_context
     except Exception as e:
         console.print(f"Error in generating edit instructions: {str(e)}", style="bold red")
         return []  # Return empty list if any exception occurs
-
 
 
 def parse_search_replace_blocks(response_text):
@@ -399,9 +405,10 @@ async def edit_and_apply(path, instructions, project_context, is_automode=False)
             file_contents[path] = original_content
 
         edit_instructions = await generate_edit_instructions(original_content, instructions, project_context)
-        
+
         if edit_instructions:
-            console.print(Panel("The following SEARCH/REPLACE blocks have been generated:", title="Edit Instructions", style="cyan"))
+            console.print(Panel("The following SEARCH/REPLACE blocks have been generated:", title="Edit Instructions",
+                                style="cyan"))
             for i, block in enumerate(edit_instructions, 1):
                 console.print(f"Block {i}:")
                 console.print(Panel(f"SEARCH:\n{block['search']}\n\nREPLACE:\n{block['replace']}", expand=False))
@@ -432,29 +439,28 @@ async def edit_and_apply(path, instructions, project_context, is_automode=False)
         return f"Error editing/applying to file: {str(e)}"
 
 
-
 async def apply_edits(file_path, edit_instructions, original_content):
     changes_made = False
     edited_content = original_content
     total_edits = len(edit_instructions)
 
     with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        console=console
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            console=console
     ) as progress:
         edit_task = progress.add_task("[cyan]Applying edits...", total=total_edits)
 
         for i, edit in enumerate(edit_instructions, 1):
             search_content = edit['search']
             replace_content = edit['replace']
-            
+
             if search_content in edited_content:
                 edited_content = edited_content.replace(search_content, replace_content)
                 changes_made = True
-                
+
                 # Display the diff for this edit
                 diff_result = generate_and_apply_diff(search_content, replace_content, file_path)
                 console.print(Panel(diff_result, title=f"Changes in {file_path} ({i}/{total_edits})", style="cyan"))
@@ -463,23 +469,24 @@ async def apply_edits(file_path, edit_instructions, original_content):
 
     return edited_content, changes_made
 
+
 async def execute_code(code, timeout=10):
     global running_processes
     venv_path, activate_script = setup_virtual_environment()
-    
+
     # Generate a unique identifier for this process
     process_id = f"process_{len(running_processes)}"
-    
+
     # Write the code to a temporary file
     with open(f"{process_id}.py", "w") as f:
         f.write(code)
-    
+
     # Prepare the command to run the code
     if sys.platform == "win32":
         command = f'"{activate_script}" && python3 {process_id}.py'
     else:
         command = f'source "{activate_script}" && python3 {process_id}.py'
-    
+
     # Create a process to run the command
     process = await asyncio.create_subprocess_shell(
         command,
@@ -488,10 +495,10 @@ async def execute_code(code, timeout=10):
         shell=True,
         preexec_fn=None if sys.platform == "win32" else os.setsid
     )
-    
+
     # Store the process in our global dictionary
     running_processes[process_id] = process
-    
+
     try:
         # Wait for initial output or timeout
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
@@ -503,9 +510,10 @@ async def execute_code(code, timeout=10):
         stdout = "Process started and running in the background."
         stderr = ""
         return_code = "Running"
-    
+
     execution_result = f"Process ID: {process_id}\n\nStdout:\n{stdout}\n\nStderr:\n{stderr}\n\nReturn Code: {return_code}"
     return process_id, execution_result
+
 
 def read_file(path):
     global file_contents
@@ -517,6 +525,7 @@ def read_file(path):
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
+
 def list_files(path="."):
     try:
         files = os.listdir(path)
@@ -524,12 +533,14 @@ def list_files(path="."):
     except Exception as e:
         return f"Error listing files: {str(e)}"
 
+
 def tavily_search(query):
     try:
         response = tavily.qna_search(query=query, search_depth="advanced")
         return response
     except Exception as e:
         return f"Error performing search: {str(e)}"
+
 
 def stop_process(process_id):
     global running_processes
@@ -673,6 +684,7 @@ tools = [
 
 from typing import Dict, Any
 
+
 async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
     try:
         result = None
@@ -725,6 +737,7 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
             "is_error": True
         }
 
+
 def encode_image_to_base64(image_path):
     try:
         with Image.open(image_path) as img:
@@ -738,9 +751,11 @@ def encode_image_to_base64(image_path):
     except Exception as e:
         return f"Error encoding image: {str(e)}"
 
+
 def parse_goals(response):
     goals = re.findall(r'Goal \d+: (.+)', response)
     return goals
+
 
 def execute_goals(goals):
     global automode
@@ -783,7 +798,8 @@ async def send_to_ai_for_executing(code, execution_result):
             max_tokens=2000,
             system=system_prompt,
             messages=[
-                {"role": "user", "content": f"Analyze this code execution from the 'code_execution_env' virtual environment:\n\nCode:\n{code}\n\nExecution Result:\n{execution_result}"}
+                {"role": "user",
+                 "content": f"Analyze this code execution from the 'code_execution_env' virtual environment:\n\nCode:\n{code}\n\nExecution Result:\n{execution_result}"}
             ]
         )
 
@@ -804,7 +820,7 @@ def save_chat():
     # Generate filename
     now = datetime.datetime.now()
     filename = f"Chat_{now.strftime('%H%M')}.md"
-    
+
     # Format conversation history
     formatted_chat = "# Claude-3-Sonnet Engineer Chat Log\n\n"
     for message in conversation_history:
@@ -823,13 +839,12 @@ def save_chat():
             for content in message['content']:
                 if content['type'] == 'tool_result':
                     formatted_chat += f"### Tool Result\n\n```\n{content['content']}\n```\n\n"
-    
+
     # Save to file
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(formatted_chat)
-    
-    return filename
 
+    return filename
 
 
 async def chat_with_claude(user_input, image_path=None, current_iteration=None, max_iterations=None):
@@ -839,7 +854,9 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
     current_conversation = []
 
     if image_path:
-        console.print(Panel(f"Processing image at path: {image_path}", title_align="left", title="Image Processing", expand=False, style="yellow"))
+        console.print(
+            Panel(f"Processing image at path: {image_path}", title_align="left", title="Image Processing", expand=False,
+                  style="yellow"))
         image_base64 = encode_image_to_base64(image_path)
 
         if image_base64.startswith("Error"):
@@ -864,7 +881,8 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
             ]
         }
         current_conversation.append(image_message)
-        console.print(Panel("Image message added to conversation history", title_align="left", title="Image Added", style="green"))
+        console.print(Panel("Image message added to conversation history", title_align="left", title="Image Added",
+                            style="green"))
     else:
         current_conversation.append({"role": "user", "content": user_input})
 
@@ -875,12 +893,12 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
             filtered_content = [
                 content for content in message['content']
                 if content.get('type') != 'tool_result' or (
-                    content.get('type') == 'tool_result' and
-                    not any(keyword in content.get('output', '') for keyword in [
-                        "File contents updated in system prompt",
-                        "File created and added to system prompt",
-                        "has been read and stored in the system prompt"
-                    ])
+                        content.get('type') == 'tool_result' and
+                        not any(keyword in content.get('output', '') for keyword in [
+                            "File contents updated in system prompt",
+                            "File created and added to system prompt",
+                            "has been read and stored in the system prompt"
+                        ])
                 )
             ]
             if filtered_content:
@@ -893,12 +911,14 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
 
     try:
         # MAINMODEL call, which maintains context
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MAINMODEL,
             max_tokens=8000,
-            system=update_system_prompt(current_iteration, max_iterations),
+            messages=[
+                {"role": "system", "content": update_system_prompt(current_iteration, max_iterations)},
+                {"role": "user", "content": "Generate SEARCH/REPLACE blocks for the necessary changes."}
+            ]
             extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
-            messages=messages,
             tools=tools,
             tool_choice={"type": "auto"}
         )
@@ -907,7 +927,8 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
         main_model_tokens['output'] += response.usage.output_tokens
     except APIStatusError as e:
         if e.status_code == 429:
-            console.print(Panel("Rate limit exceeded. Retrying after a short delay...", title="API Error", style="bold yellow"))
+            console.print(
+                Panel("Rate limit exceeded. Retrying after a short delay...", title="API Error", style="bold yellow"))
             time.sleep(5)
             return await chat_with_claude(user_input, image_path, current_iteration, max_iterations)
         else:
@@ -929,14 +950,17 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
         elif content_block.type == "tool_use":
             tool_uses.append(content_block)
 
-    console.print(Panel(Markdown(assistant_response), title="Claude's Response", title_align="left", border_style="blue", expand=False))
+    console.print(
+        Panel(Markdown(assistant_response), title="Claude's Response", title_align="left", border_style="blue",
+              expand=False))
 
     # Display files in context
     if file_contents:
         files_in_context = "\n".join(file_contents.keys())
     else:
         files_in_context = "No files in context. Read, create, or edit files to add."
-    console.print(Panel(files_in_context, title="Files in Context", title_align="left", border_style="white", expand=False))
+    console.print(
+        Panel(files_in_context, title="Files in Context", title_align="left", border_style="white", expand=False))
 
     for tool_use in tool_uses:
         tool_name = tool_use.name
@@ -947,7 +971,7 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
         console.print(Panel(f"Tool Input: {json.dumps(tool_input, indent=2)}", style="green"))
 
         tool_result = await execute_tool(tool_name, tool_input)
-        
+
         if tool_result["is_error"]:
             console.print(Panel(tool_result["content"], title="Tool Execution Error", style="bold red"))
         else:
@@ -982,8 +1006,8 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
             if 'path' in tool_input:
                 file_path = tool_input['path']
                 if "File contents updated in system prompt" in tool_result["content"] or \
-                   "File created and added to system prompt" in tool_result["content"] or \
-                   "has been read and stored in the system prompt" in tool_result["content"]:
+                        "File created and added to system prompt" in tool_result["content"] or \
+                        "has been read and stored in the system prompt" in tool_result["content"]:
                     # The file_contents dictionary is already updated in the tool function
                     pass
 
@@ -1007,7 +1031,9 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
             for tool_content_block in tool_response.content:
                 if tool_content_block.type == "text":
                     tool_checker_response += tool_content_block.text
-            console.print(Panel(Markdown(tool_checker_response), title="Claude's Response to Tool Result",  title_align="left", border_style="blue", expand=False))
+            console.print(
+                Panel(Markdown(tool_checker_response), title="Claude's Response to Tool Result", title_align="left",
+                      border_style="blue", expand=False))
             assistant_response += "\n\n" + tool_checker_response
         except APIError as e:
             error_message = f"Error in tool response: {str(e)}"
@@ -1024,6 +1050,7 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
 
     return assistant_response, exit_continuation
 
+
 def reset_code_editor_memory():
     global code_editor_memory
     code_editor_memory = []
@@ -1039,8 +1066,10 @@ def reset_conversation():
     code_execution_tokens = {'input': 0, 'output': 0}
     file_contents = {}
     reset_code_editor_memory()
-    console.print(Panel("Conversation history, token counts, file contents, and code editor memory have been reset.", title="Reset", style="bold green"))
+    console.print(Panel("Conversation history, token counts, file contents, and code editor memory have been reset.",
+                        title="Reset", style="bold green"))
     display_token_usage()
+
 
 def display_token_usage():
     from rich.table import Table
@@ -1114,10 +1143,11 @@ def display_token_usage():
     console.print(table)
 
 
-
 async def main():
     global automode, conversation_history
-    console.print(Panel("Welcome to the Claude-3-Sonnet Engineer Chat with Multi-Agent and Image Support!", title="Welcome", style="bold green"))
+    console.print(
+        Panel("Welcome to the Claude-3-Sonnet Engineer Chat with Multi-Agent and Image Support!", title="Welcome",
+              style="bold green"))
     console.print("Type 'exit' to end the conversation.")
     console.print("Type 'image' to include an image in your message.")
     console.print("Type 'automode [number]' to enter Autonomous mode with a specific number of iterations.")
@@ -1129,7 +1159,8 @@ async def main():
         user_input = console.input("[bold cyan]You:[/bold cyan] ")
 
         if user_input.lower() == 'exit':
-            console.print(Panel("Thank you for chatting. Goodbye!", title_align="left", title="Goodbye", style="bold green"))
+            console.print(
+                Panel("Thank you for chatting. Goodbye!", title_align="left", title="Goodbye", style="bold green"))
             break
 
         if user_input.lower() == 'reset':
@@ -1142,7 +1173,8 @@ async def main():
             continue
 
         if user_input.lower() == 'image':
-            image_path = console.input("[bold cyan]Drag and drop your image here, then press enter:[/bold cyan] ").strip().replace("'", "")
+            image_path = console.input(
+                "[bold cyan]Drag and drop your image here, then press enter:[/bold cyan] ").strip().replace("'", "")
 
             if os.path.isfile(image_path):
                 user_input = console.input("[bold cyan]You (prompt for image):[/bold cyan] ")
@@ -1159,40 +1191,56 @@ async def main():
                     max_iterations = MAX_CONTINUATION_ITERATIONS
 
                 automode = True
-                console.print(Panel(f"Entering automode with {max_iterations} iterations. Please provide the goal of the automode.", title_align="left", title="Automode", style="bold yellow"))
+                console.print(Panel(
+                    f"Entering automode with {max_iterations} iterations. Please provide the goal of the automode.",
+                    title_align="left", title="Automode", style="bold yellow"))
                 console.print(Panel("Press Ctrl+C at any time to exit the automode loop.", style="bold yellow"))
                 user_input = console.input("[bold cyan]You:[/bold cyan] ")
 
                 iteration_count = 0
                 try:
                     while automode and iteration_count < max_iterations:
-                        response, exit_continuation = await chat_with_claude(user_input, current_iteration=iteration_count+1, max_iterations=max_iterations)
+                        response, exit_continuation = await chat_with_claude(user_input,
+                                                                             current_iteration=iteration_count + 1,
+                                                                             max_iterations=max_iterations)
 
                         if exit_continuation or CONTINUATION_EXIT_PHRASE in response:
-                            console.print(Panel("Automode completed.", title_align="left", title="Automode", style="green"))
+                            console.print(
+                                Panel("Automode completed.", title_align="left", title="Automode", style="green"))
                             automode = False
                         else:
-                            console.print(Panel(f"Continuation iteration {iteration_count + 1} completed. Press Ctrl+C to exit automode. ", title_align="left", title="Automode", style="yellow"))
+                            console.print(Panel(
+                                f"Continuation iteration {iteration_count + 1} completed. Press Ctrl+C to exit automode. ",
+                                title_align="left", title="Automode", style="yellow"))
                             user_input = "Continue with the next step. Or STOP by saying 'AUTOMODE_COMPLETE' if you think you've achieved the results established in the original request."
                         iteration_count += 1
 
                         if iteration_count >= max_iterations:
-                            console.print(Panel("Max iterations reached. Exiting automode.", title_align="left", title="Automode", style="bold red"))
+                            console.print(
+                                Panel("Max iterations reached. Exiting automode.", title_align="left", title="Automode",
+                                      style="bold red"))
                             automode = False
                 except KeyboardInterrupt:
-                    console.print(Panel("\nAutomode interrupted by user. Exiting automode.", title_align="left", title="Automode", style="bold red"))
+                    console.print(
+                        Panel("\nAutomode interrupted by user. Exiting automode.", title_align="left", title="Automode",
+                              style="bold red"))
                     automode = False
                     if conversation_history and conversation_history[-1]["role"] == "user":
-                        conversation_history.append({"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
+                        conversation_history.append(
+                            {"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
             except KeyboardInterrupt:
-                console.print(Panel("\nAutomode interrupted by user. Exiting automode.", title_align="left", title="Automode", style="bold red"))
+                console.print(
+                    Panel("\nAutomode interrupted by user. Exiting automode.", title_align="left", title="Automode",
+                          style="bold red"))
                 automode = False
                 if conversation_history and conversation_history[-1]["role"] == "user":
-                    conversation_history.append({"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
+                    conversation_history.append(
+                        {"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
 
             console.print(Panel("Exited automode. Returning to regular chat.", style="green"))
         else:
             response, _ = await chat_with_claude(user_input)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
