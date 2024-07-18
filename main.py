@@ -51,7 +51,11 @@ load_dotenv()
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 if not anthropic_api_key:
     raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
-client = Anthropic(api_key=anthropic_api_key)
+anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL")
+if not anthropic_base_url:
+    client = Anthropic(api_key=anthropic_api_key,base_url=anthropic_base_url)
+else:
+    client = Anthropic(api_key=anthropic_api_key)
 
 # Initialize the Tavily client
 tavily_api_key = os.getenv("TAVILY_API_KEY")
@@ -335,7 +339,7 @@ async def generate_edit_instructions(file_content, instructions, project_context
         # Make the API call to CODEEDITORMODEL (context is not maintained except for code_editor_memory)
         response = client.messages.create(
             model=CODEEDITORMODEL,
-            max_tokens=8000,
+            max_tokens=4096,
             system=system_prompt,
             extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
             messages=[
@@ -895,7 +899,7 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
         # MAINMODEL call, which maintains context
         response = client.messages.create(
             model=MAINMODEL,
-            max_tokens=8000,
+            max_tokens=4096,
             system=update_system_prompt(current_iteration, max_iterations),
             extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
             messages=messages,
@@ -992,7 +996,7 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
         try:
             tool_response = client.messages.create(
                 model=TOOLCHECKERMODEL,
-                max_tokens=8000,
+                max_tokens=4096,
                 system=update_system_prompt(current_iteration, max_iterations),
                 extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
                 messages=messages,
