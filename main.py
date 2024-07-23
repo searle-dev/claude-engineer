@@ -15,6 +15,15 @@ from rich.syntax import Syntax
 from rich.markdown import Markdown
 import asyncio
 import aiohttp
+from prompt_toolkit import PromptSession
+from prompt_toolkit.styles import Style
+
+async def get_user_input(prompt="You: "):
+    style = Style.from_dict({
+        'prompt': 'cyan bold',
+    })
+    session = PromptSession(style=style)
+    return await session.prompt_async(prompt, multiline=False)
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 import datetime
 import venv
@@ -81,6 +90,9 @@ file_contents = {}
 # Code editor memory (maintains some context for CODEEDITORMODEL between calls)
 code_editor_memory = []
 
+# Files already present in code editor's context
+code_editor_files = set()
+
 # automode flag
 automode = False
 
@@ -102,7 +114,7 @@ MAINMODEL = "claude-3-5-sonnet-20240620"  # Maintains conversation history and f
 # Models that don't maintain context (memory is reset after each call)
 TOOLCHECKERMODEL = "claude-3-5-sonnet-20240620"
 CODEEDITORMODEL = "claude-3-5-sonnet-20240620"
-CODEEXECUTIONMODEL = "claude-3-haiku-20240307"
+CODEEXECUTIONMODEL = "claude-3-5-sonnet-20240620"
 
 # System prompts
 BASE_SYSTEM_PROMPT = """
@@ -129,11 +141,10 @@ Available tools and their optimal use cases:
    - Anticipate potential issues or conflicts that might arise from the changes and provide guidance on how to handle them.
 4. execute_code: Run Python code exclusively in the 'code_execution_env' virtual environment and analyze its output. Use this when you need to test code functionality or diagnose issues. Remember that all code execution happens in this isolated environment. This tool now returns a process ID for long-running processes.
 5. stop_process: Stop a running process by its ID. Use this when you need to terminate a long-running process started by the execute_code tool.
-6. execute_code: Run Python code exclusively in the 'code_execution_env' virtual environment and analyze its output.
-7. stop_process: Stop a running process by its ID.
-8. read_file: Read the contents of an existing file.
-9. list_files: List all files and directories in a specified folder.
-10. tavily_search: Perform a web search using the Tavily API for up-to-date information.
+6. read_file: Read the contents of an existing file.
+7. read_multiple_files: Read the contents of multiple existing files at once. Use this when you need to examine or work with multiple files simultaneously.
+8. list_files: List all files and directories in a specified folder.
+9. tavily_search: Perform a web search using the Tavily API for up-to-date information.
 
 Tool Usage Guidelines:
 - Always use the most appropriate tool for the task at hand.
@@ -142,6 +153,7 @@ Tool Usage Guidelines:
 - Use execute_code to run and test code within the 'code_execution_env' virtual environment, then analyze the results.
 - For long-running processes, use the process ID returned by execute_code to stop them later if needed.
 - Proactively use tavily_search when you need up-to-date information or additional context.
+- When working with multiple files, consider using read_multiple_files for efficiency.
 
 Error Handling and Recovery:
 - If a tool operation fails, carefully analyze the error message and attempt to resolve the issue.
@@ -290,11 +302,17 @@ def generate_and_apply_diff(original_content, new_content, path):
         return f"Error applying changes: {str(e)}"
 
 
-async def generate_edit_instructions(file_content, instructions, project_context):
-    global code_editor_tokens, code_editor_memory
+async def generate_edit_instructions(file_path, file_content, instructions, project_context, full_file_contents):
+    global code_editor_tokens, code_editor_memory, code_editor_files
     try:
         # Prepare memory context (this is the only part that maintains some context between calls)
         memory_context = "\n".join([f"Memory {i+1}:\n{mem}" for i, mem in enumerate(code_editor_memory)])
+
+        # Prepare full file contents context, excluding the file being edited if it's already in code_editor_files
+        full_file_contents_context = "\n\n".join([
+            f"--- {path} ---\n{content}" for path, content in full_file_contents.items()
+            if path != file_path or path not in code_editor_files
+        ])
 
         system_prompt = f"""
         You are an AI coding agent that generates edit instructions for code files. Your task is to analyze the provided code and generate SEARCH/REPLACE blocks for necessary changes. Follow these steps:
@@ -311,17 +329,21 @@ async def generate_edit_instructions(file_content, instructions, project_context
         4. Consider the memory of previous edits:
         {memory_context}
 
-        5. Generate SEARCH/REPLACE blocks for each necessary change. Each block should:
+        5. Consider the full context of all files in the project:
+        {full_file_contents_context}
+
+        6. Generate SEARCH/REPLACE blocks for each necessary change. Each block should:
            - Include enough context to uniquely identify the code to be changed
            - Provide the exact replacement code, maintaining correct indentation and formatting
            - Focus on specific, targeted changes rather than large, sweeping modifications
 
-        6. Ensure that your SEARCH/REPLACE blocks:
+        7. Ensure that your SEARCH/REPLACE blocks:
            - Address all relevant aspects of the instructions
            - Maintain or enhance code readability and efficiency
            - Consider the overall structure and purpose of the code
            - Follow best practices and coding standards for the language
            - Maintain consistency with the project context and previous edits
+           - Take into account the full context of all files in the project
 
         IMPORTANT: RETURN ONLY THE SEARCH/REPLACE BLOCKS. NO EXPLANATIONS OR COMMENTS.
         USE THE FOLLOWING FORMAT FOR EACH BLOCK:
@@ -354,7 +376,10 @@ async def generate_edit_instructions(file_content, instructions, project_context
         edit_instructions = parse_search_replace_blocks(response.content[0].text)
 
         # Update code editor memory (this is the only part that maintains some context between calls)
-        code_editor_memory.append(f"Edit Instructions:\n{response.content[0].text}")
+        code_editor_memory.append(f"Edit Instructions for {file_path}:\n{response.content[0].text}")
+
+        # Add the file to code_editor_files set
+        code_editor_files.add(file_path)
 
         return edit_instructions
 
@@ -366,34 +391,19 @@ async def generate_edit_instructions(file_content, instructions, project_context
 
 def parse_search_replace_blocks(response_text):
     blocks = []
-    lines = response_text.split('\n')
-    current_block = {}
-    current_section = None
-
-    for line in lines:
-        if line.strip() == '<SEARCH>':
-            current_section = 'search'
-            current_block['search'] = []
-        elif line.strip() == '</SEARCH>':
-            current_section = None
-        elif line.strip() == '<REPLACE>':
-            current_section = 'replace'
-            current_block['replace'] = []
-        elif line.strip() == '</REPLACE>':
-            current_section = None
-            if 'search' in current_block and 'replace' in current_block:
-                blocks.append({
-                    'search': '\n'.join(current_block['search']),
-                    'replace': '\n'.join(current_block['replace'])
-                })
-            current_block = {}
-        elif current_section:
-            current_block[current_section].append(line)
-
-    return blocks
+    pattern = r'<SEARCH>\n(.*?)\n</SEARCH>\n<REPLACE>\n(.*?)\n</REPLACE>'
+    matches = re.findall(pattern, response_text, re.DOTALL)
+    
+    for search, replace in matches:
+        blocks.append({
+            'search': search.strip(),
+            'replace': replace.strip()
+        })
+    
+    return json.dumps(blocks)  # Keep returning JSON string
 
 
-async def edit_and_apply(path, instructions, project_context, is_automode=False):
+async def edit_and_apply(path, instructions, project_context, is_automode=False, max_retries=3):
     global file_contents
     try:
         original_content = file_contents.get(path, "")
@@ -402,36 +412,37 @@ async def edit_and_apply(path, instructions, project_context, is_automode=False)
                 original_content = file.read()
             file_contents[path] = original_content
 
-        edit_instructions = await generate_edit_instructions(original_content, instructions, project_context)
-        
-        if edit_instructions:
-            console.print(Panel("The following SEARCH/REPLACE blocks have been generated:", title="Edit Instructions", style="cyan"))
-            for i, block in enumerate(edit_instructions, 1):
-                console.print(f"Block {i}:")
-                console.print(Panel(f"SEARCH:\n{block['search']}\n\nREPLACE:\n{block['replace']}", expand=False))
+        for attempt in range(max_retries):
+            edit_instructions_json = await generate_edit_instructions(path, original_content, instructions, project_context, file_contents)
+            
+            if edit_instructions_json:
+                edit_instructions = json.loads(edit_instructions_json)  # Parse JSON here
+                console.print(Panel(f"Attempt {attempt + 1}/{max_retries}: The following SEARCH/REPLACE blocks have been generated:", title="Edit Instructions", style="cyan"))
+                for i, block in enumerate(edit_instructions, 1):
+                    console.print(f"Block {i}:")
+                    console.print(Panel(f"SEARCH:\n{block['search']}\n\nREPLACE:\n{block['replace']}", expand=False))
 
-            edited_content, changes_made = await apply_edits(path, edit_instructions, original_content)
+                edited_content, changes_made, failed_edits = await apply_edits(path, edit_instructions, original_content)
 
-            if changes_made:
-                diff_result = generate_and_apply_diff(original_content, edited_content, path)
-
-                console.print(Panel("The following changes will be applied:", title="File Changes", style="cyan"))
-                console.print(diff_result)
-
-                if not is_automode:
-                    confirm = console.input("[bold yellow]Do you want to apply these changes? (yes/no): [/bold yellow]")
-                    if confirm.lower() != 'yes':
-                        return "Changes were not applied."
-
-                with open(path, 'w') as file:
-                    file.write(edited_content)
-                file_contents[path] = edited_content  # Update the file_contents with the new content
-                console.print(Panel(f"File contents updated in system prompt: {path}", style="green"))
-                return f"Changes applied to {path}:\n{diff_result}"
+                if changes_made:
+                    file_contents[path] = edited_content  # Update the file_contents with the new content
+                    console.print(Panel(f"File contents updated in system prompt: {path}", style="green"))
+                    
+                    if failed_edits:
+                        console.print(Panel(f"Some edits could not be applied. Retrying...", style="yellow"))
+                        instructions += f"\n\nPlease retry the following edits that could not be applied:\n{failed_edits}"
+                        original_content = edited_content
+                        continue
+                    
+                    return f"Changes applied to {path}"
+                elif attempt == max_retries - 1:
+                    return f"No changes could be applied to {path} after {max_retries} attempts. Please review the edit instructions and try again."
+                else:
+                    console.print(Panel(f"No changes could be applied in attempt {attempt + 1}. Retrying...", style="yellow"))
             else:
-                return f"No changes needed for {path}"
-        else:
-            return f"No changes suggested for {path}"
+                return f"No changes suggested for {path}"
+        
+        return f"Failed to apply changes to {path} after {max_retries} attempts."
     except Exception as e:
         return f"Error editing/applying to file: {str(e)}"
 
@@ -441,6 +452,7 @@ async def apply_edits(file_path, edit_instructions, original_content):
     changes_made = False
     edited_content = original_content
     total_edits = len(edit_instructions)
+    failed_edits = []
 
     with Progress(
         SpinnerColumn(),
@@ -452,20 +464,53 @@ async def apply_edits(file_path, edit_instructions, original_content):
         edit_task = progress.add_task("[cyan]Applying edits...", total=total_edits)
 
         for i, edit in enumerate(edit_instructions, 1):
-            search_content = edit['search']
-            replace_content = edit['replace']
+            search_content = edit['search'].strip()
+            replace_content = edit['replace'].strip()
             
-            if search_content in edited_content:
-                edited_content = edited_content.replace(search_content, replace_content)
+            # Use regex to find the content, ignoring leading/trailing whitespace
+            pattern = re.compile(re.escape(search_content), re.DOTALL)
+            match = pattern.search(edited_content)
+            
+            if match:
+                # Replace the content, preserving the original whitespace
+                start, end = match.span()
+                # Strip <SEARCH> and <REPLACE> tags from replace_content
+                replace_content_cleaned = re.sub(r'</?SEARCH>|</?REPLACE>', '', replace_content)
+                edited_content = edited_content[:start] + replace_content_cleaned + edited_content[end:]
                 changes_made = True
                 
                 # Display the diff for this edit
-                diff_result = generate_and_apply_diff(search_content, replace_content, file_path)
+                diff_result = generate_diff(search_content, replace_content, file_path)
                 console.print(Panel(diff_result, title=f"Changes in {file_path} ({i}/{total_edits})", style="cyan"))
+            else:
+                console.print(Panel(f"Edit {i}/{total_edits} not applied: content not found", style="yellow"))
+                failed_edits.append(f"Edit {i}: {search_content}")
 
             progress.update(edit_task, advance=1)
 
-    return edited_content, changes_made
+    if not changes_made:
+        console.print(Panel("No changes were applied. The file content already matches the desired state.", style="green"))
+    else:
+        # Write the changes to the file
+        with open(file_path, 'w') as file:
+            file.write(edited_content)
+        console.print(Panel(f"Changes have been written to {file_path}", style="green"))
+
+    return edited_content, changes_made, "\n".join(failed_edits)
+
+def generate_diff(original, new, path):
+    diff = list(difflib.unified_diff(
+        original.splitlines(keepends=True),
+        new.splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        n=3
+    ))
+
+    diff_text = ''.join(diff)
+    highlighted_diff = highlight_diff(diff_text)
+
+    return highlighted_diff
 
 async def execute_code(code, timeout=10):
     global running_processes
@@ -520,6 +565,19 @@ def read_file(path):
         return f"File '{path}' has been read and stored in the system prompt."
     except Exception as e:
         return f"Error reading file: {str(e)}"
+
+def read_multiple_files(paths):
+    global file_contents
+    results = []
+    for path in paths:
+        try:
+            with open(path, 'r') as f:
+                content = f.read()
+            file_contents[path] = content
+            results.append(f"File '{path}' has been read and stored in the system prompt.")
+        except Exception as e:
+            results.append(f"Error reading file '{path}': {str(e)}")
+    return "\n".join(results)
 
 def list_files(path="."):
     try:
@@ -647,6 +705,23 @@ tools = [
         }
     },
     {
+        "name": "read_multiple_files",
+        "description": "Read the contents of multiple files at the specified paths. This tool should be used when you need to examine the contents of multiple existing files at once. It will return the status of reading each file, and store the contents of successfully read files in the system prompt. If a file doesn't exist or can't be read, an appropriate error message will be returned for that file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "An array of absolute or relative paths of the files to read. Use forward slashes (/) for path separation, even on Windows systems."
+                }
+            },
+            "required": ["paths"]
+        }
+    },
+    {
         "name": "list_files",
         "description": "List all files and directories in the specified folder. This tool should be used when you need to see the contents of a directory. It will return a list of all files and subdirectories in the specified path. If the directory doesn't exist or can't be read, an appropriate error message will be returned.",
         "input_schema": {
@@ -695,6 +770,8 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
             )
         elif tool_name == "read_file":
             result = read_file(tool_input["path"])
+        elif tool_name == "read_multiple_files":
+            result = read_multiple_files(tool_input["paths"])
         elif tool_name == "list_files":
             result = list_files(tool_input.get("path", "."))
         elif tool_name == "tavily_search":
@@ -1035,15 +1112,16 @@ def reset_code_editor_memory():
 
 
 def reset_conversation():
-    global conversation_history, main_model_tokens, tool_checker_tokens, code_editor_tokens, code_execution_tokens, file_contents
+    global conversation_history, main_model_tokens, tool_checker_tokens, code_editor_tokens, code_execution_tokens, file_contents, code_editor_files
     conversation_history = []
     main_model_tokens = {'input': 0, 'output': 0}
     tool_checker_tokens = {'input': 0, 'output': 0}
     code_editor_tokens = {'input': 0, 'output': 0}
     code_execution_tokens = {'input': 0, 'output': 0}
     file_contents = {}
+    code_editor_files = set()
     reset_code_editor_memory()
-    console.print(Panel("Conversation history, token counts, file contents, and code editor memory have been reset.", title="Reset", style="bold green"))
+    console.print(Panel("Conversation history, token counts, file contents, code editor memory, and code editor files have been reset.", title="Reset", style="bold green"))
     display_token_usage()
 
 def display_token_usage():
@@ -1063,7 +1141,7 @@ def display_token_usage():
         "Main Model": {"input": 3.00, "output": 15.00, "has_context": True},
         "Tool Checker": {"input": 3.00, "output": 15.00, "has_context": False},
         "Code Editor": {"input": 3.00, "output": 15.00, "has_context": True},
-        "Code Execution": {"input": 0.25, "output": 1.25, "has_context": False}
+        "Code Execution": {"input": 3.00, "output": 15.00, "has_context": False}
     }
 
     total_input = 0
@@ -1130,7 +1208,7 @@ async def main():
     console.print("While in automode, press Ctrl+C at any time to exit the automode to return to regular chat.")
 
     while True:
-        user_input = console.input("[bold cyan]You:[/bold cyan] ")
+        user_input = await get_user_input()
 
         if user_input.lower() == 'exit':
             console.print(Panel("Thank you for chatting. Goodbye!", title_align="left", title="Goodbye", style="bold green"))
@@ -1146,10 +1224,10 @@ async def main():
             continue
 
         if user_input.lower() == 'image':
-            image_path = console.input("[bold cyan]Drag and drop your image here, then press enter:[/bold cyan] ").strip().replace("'", "")
+            image_path = (await get_user_input("Drag and drop your image here, then press enter: ")).strip().replace("'", "")
 
             if os.path.isfile(image_path):
-                user_input = console.input("[bold cyan]You (prompt for image):[/bold cyan] ")
+                user_input = await get_user_input("You (prompt for image): ")
                 response, _ = await chat_with_claude(user_input, image_path)
             else:
                 console.print(Panel("Invalid image path. Please try again.", title="Error", style="bold red"))
@@ -1165,7 +1243,7 @@ async def main():
                 automode = True
                 console.print(Panel(f"Entering automode with {max_iterations} iterations. Please provide the goal of the automode.", title_align="left", title="Automode", style="bold yellow"))
                 console.print(Panel("Press Ctrl+C at any time to exit the automode loop.", style="bold yellow"))
-                user_input = console.input("[bold cyan]You:[/bold cyan] ")
+                user_input = await get_user_input()
 
                 iteration_count = 0
                 try:
