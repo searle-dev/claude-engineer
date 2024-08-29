@@ -17,6 +17,7 @@ import asyncio
 import aiohttp
 from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
+import difflib
 from prompt_toolkit.completion import WordCompleter
 
 
@@ -97,6 +98,8 @@ tool_checker_tokens = {'input': 0, 'output': 0}
 code_editor_tokens = {'input': 0, 'output': 0}
 code_execution_tokens = {'input': 0, 'output': 0}
 
+USE_FUZZY_SEARCH = True
+
 # Set up the conversation memory (maintains context for MAINMODEL)
 conversation_history = []
 
@@ -123,11 +126,7 @@ CONTINUATION_EXIT_PHRASE = "AUTOMODE_COMPLETE"
 MAX_CONTINUATION_ITERATIONS = 25
 MAX_CONTEXT_TOKENS = 200000  # Reduced to 200k tokens for context window
 
-# Models
-# Models that maintain context memory across interactions
-MAINMODEL = "claude-3-5-sonnet-20240620"  # Maintains conversation history and file contents
-
-# Models that don't maintain context (memory is reset after each call)
+MAINMODEL = "claude-3-5-sonnet-20240620"
 TOOLCHECKERMODEL = "claude-3-5-sonnet-20240620"
 CODEEDITORMODEL = "claude-3-5-sonnet-20240620"
 CODEEXECUTIONMODEL = "claude-3-5-sonnet-20240620"
@@ -148,12 +147,13 @@ You are Claude, an AI assistant powered by Anthropic's Claude-3.5-Sonnet model, 
 Available tools and their optimal use cases:
 
 1. create_folder: Create new directories in the project structure.
-2. create_file: Generate new files with specified content. Strive to make the file as complete and useful as possible.
-3. edit_and_apply: Examine and modify existing files by instructing a separate AI coding agent. You are responsible for providing clear, detailed instructions to this agent. When using this tool:
+2. create_files: Generate multiple new files with specified content. Strive to make the files as complete and useful as possible.
+3. edit_and_apply_multiple: Examine and modify multiple existing files by instructing a separate AI coding agent. You are responsible for providing clear, detailed instructions for each file. When using this tool:
    - Provide comprehensive context about the project, including recent changes, new variables or functions, and how files are interconnected.
-   - Clearly state the specific changes or improvements needed, explaining the reasoning behind each modification.
+   - Clearly state the specific changes or improvements needed for each file, explaining the reasoning behind each modification.
    - Include ALL the snippets of code to change, along with the desired modifications.
    - Specify coding standards, naming conventions, or architectural patterns to be followed.
+   - Anticipate potential issues or conflicts that might arise from the changes and provide guidance on how to handle them.
    - Anticipate potential issues or conflicts that might arise from the changes and provide guidance on how to handle them.
 4. execute_code: Run Python code exclusively in the 'code_execution_env' virtual environment and analyze its output. Use this when you need to test code functionality or diagnose issues. Remember that all code execution happens in this isolated environment. This tool now returns a process ID for long-running processes.
 5. stop_process: Stop a running process by its ID. Use this when you need to terminate a long-running process started by the execute_code tool.
@@ -251,25 +251,36 @@ def update_system_prompt(current_iteration: Optional[int] = None, max_iterations
     else:
         return BASE_SYSTEM_PROMPT + file_contents_prompt + "\n\n" + chain_of_thought_prompt
 
-def create_folder(path):
-    try:
-        os.makedirs(path, exist_ok=True)
-        return f"Folder created: {path}"
-    except Exception as e:
-        return f"Error creating folder: {str(e)}"
+def create_folders(paths):
+    results = []
+    for path in paths:
+        try:
+            os.makedirs(path, exist_ok=True)
+            results.append(f"Folder created: {path}")
+        except Exception as e:
+            results.append(f"Error creating folder {path}: {str(e)}")
+    return "\n".join(results)
 
-def create_file(path, content=""):
+def create_files(files):
     global file_contents
-    try:
-        with open(path, 'w') as f:
-            f.write(content)
-        file_contents[path] = content
-        return f"File created and added to system prompt: {path}"
-    except Exception as e:
-        return f"Error creating file: {str(e)}"
-
-def highlight_diff(diff_text):
-    return Syntax(diff_text, "diff", theme="monokai", line_numbers=True)
+    results = []
+    # Handle both single file and multiple files
+    if isinstance(files, dict):
+        files = [files]
+    for file in files:
+        try:
+            path = file['path']
+            content = file['content']
+            dir_name = os.path.dirname(path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+            with open(path, 'w') as f:
+                f.write(content)
+            file_contents[path] = content
+            results.append(f"File created and added to system prompt: {path}")
+        except Exception as e:
+            results.append(f"Error creating file {path}: {str(e)}")
+    return "\n".join(results)
 
 
 async def generate_edit_instructions(file_path, file_content, instructions, project_context, full_file_contents):
@@ -328,19 +339,26 @@ async def generate_edit_instructions(file_path, file_content, instructions, proj
         If no changes are needed, return an empty list.
         """
 
-        # Make the API call to CODEEDITORMODEL (context is not maintained except for code_editor_memory)
-        response = client.messages.create(
+        response = client.beta.prompt_caching.messages.create(
             model=CODEEDITORMODEL,
             max_tokens=4096,
-            system=system_prompt,
-            extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
             messages=[
                 {"role": "user", "content": "Generate SEARCH/REPLACE blocks for the necessary changes."}
-            ]
+            ],
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
         )
         # Update token usage for code editor
         code_editor_tokens['input'] += response.usage.input_tokens
         code_editor_tokens['output'] += response.usage.output_tokens
+        code_editor_tokens['cache_creation'] = response.usage.cache_creation_input_tokens
+        code_editor_tokens['cache_read'] = response.usage.cache_read_input_tokens
 
         # Parse the response to extract SEARCH/REPLACE blocks
         edit_instructions = parse_search_replace_blocks(response.content[0].text)
@@ -359,62 +377,97 @@ async def generate_edit_instructions(file_path, file_content, instructions, proj
 
 
 
-def parse_search_replace_blocks(response_text):
+def parse_search_replace_blocks(response_text, use_fuzzy=USE_FUZZY_SEARCH):
+    """
+    Parse the response text for SEARCH/REPLACE blocks.
+
+    Args:
+    response_text (str): The text containing SEARCH/REPLACE blocks.
+    use_fuzzy (bool): Whether to use fuzzy matching for search blocks.
+
+    Returns:
+    list: A list of dictionaries, each containing 'search', 'replace', and 'similarity' keys.
+    """
     blocks = []
-    pattern = r'<SEARCH>\n(.*?)\n</SEARCH>\n<REPLACE>\n(.*?)\n</REPLACE>'
+    pattern = r'<SEARCH>\s*(.*?)\s*</SEARCH>\s*<REPLACE>\s*(.*?)\s*</REPLACE>'
     matches = re.findall(pattern, response_text, re.DOTALL)
     
     for search, replace in matches:
+        search = search.strip()
+        replace = replace.strip()
+        similarity = 1.0  # Default to exact match
+
+        if use_fuzzy and search not in response_text:
+            # Implement fuzzy matching logic here
+            best_match = difflib.get_close_matches(search, [response_text], n=1, cutoff=0.6)
+            if best_match:
+                similarity = difflib.SequenceMatcher(None, search, best_match[0]).ratio()
+            else:
+                similarity = 0.0
+
         blocks.append({
-            'search': search.strip(),
-            'replace': replace.strip()
+            'search': search,
+            'replace': replace,
+            'similarity': similarity
         })
     
-    return json.dumps(blocks)  # Keep returning JSON string
+    return blocks
 
 
-async def edit_and_apply(path, instructions, project_context, is_automode=False, max_retries=3):
+async def edit_and_apply_multiple(files, project_context, is_automode=False, max_retries=3):
     global file_contents
-    try:
-        original_content = file_contents.get(path, "")
-        if not original_content:
-            with open(path, 'r') as file:
-                original_content = file.read()
-            file_contents[path] = original_content
+    results = []
+    console_outputs = []
+    for file in files:
+        path = file['path']
+        instructions = file['instructions']
+        try:
+            original_content = file_contents.get(path, "")
+            if not original_content:
+                with open(path, 'r') as f:
+                    original_content = f.read()
+                file_contents[path] = original_content
 
-        for attempt in range(max_retries):
-            edit_instructions_json = await generate_edit_instructions(path, original_content, instructions, project_context, file_contents)
-            
-            if edit_instructions_json:
-                edit_instructions = json.loads(edit_instructions_json)  # Parse JSON here
-                console.print(Panel(f"Attempt {attempt + 1}/{max_retries}: The following SEARCH/REPLACE blocks have been generated:", title="Edit Instructions", style="cyan"))
-                for i, block in enumerate(edit_instructions, 1):
-                    console.print(f"Block {i}:")
-                    console.print(Panel(f"SEARCH:\n{block['search']}\n\nREPLACE:\n{block['replace']}", expand=False))
+            for attempt in range(max_retries):
+                edit_instructions = await generate_edit_instructions(path, original_content, instructions, project_context, file_contents)
 
-                edited_content, changes_made, failed_edits = await apply_edits(path, edit_instructions, original_content)
+                if edit_instructions:
+                    console.print(Panel(f"File: {path}\nAttempt {attempt + 1}/{max_retries}: The following SEARCH/REPLACE blocks have been generated:", title="Edit Instructions", style="cyan"))
+                    for i, block in enumerate(edit_instructions, 1):
+                        console.print(f"Block {i}:")
+                        console.print(Panel(f"SEARCH:\n{block['search']}\n\nREPLACE:\n{block['replace']}\nSimilarity: {block['similarity']:.2f}", expand=False))
 
-                if changes_made:
-                    file_contents[path] = edited_content  # Update the file_contents with the new content
-                    console.print(Panel(f"File contents updated in system prompt: {path}", style="green"))
-                    
-                    if failed_edits:
-                        console.print(Panel(f"Some edits could not be applied. Retrying...", style="yellow"))
-                        instructions += f"\n\nPlease retry the following edits that could not be applied:\n{failed_edits}"
-                        original_content = edited_content
-                        continue
-                    
-                    return f"Changes applied to {path}"
-                elif attempt == max_retries - 1:
-                    return f"No changes could be applied to {path} after {max_retries} attempts. Please review the edit instructions and try again."
+                    edited_content, changes_made, failed_edits, console_output = await apply_edits(path, edit_instructions, original_content)
+                    console_outputs.append(console_output)
+
+                    if changes_made:
+                        file_contents[path] = edited_content  # Update the file_contents with the new content
+                        console.print(Panel(f"File contents updated in system prompt: {path}", style="green"))
+
+                        if failed_edits:
+                            console.print(Panel(f"Some edits could not be applied to {path}. Retrying...", style="yellow"))
+                            instructions += f"\n\nPlease retry the following edits that could not be applied:\n{failed_edits}"
+                            original_content = edited_content
+                            continue
+
+                        results.append(f"Changes applied to {path}")
+                        break
+                    elif attempt == max_retries - 1:
+                        results.append(f"No changes could be applied to {path} after {max_retries} attempts. Please review the edit instructions and try again.")
+                    else:
+                        console.print(Panel(f"No changes could be applied to {path} in attempt {attempt + 1}. Retrying...", style="yellow"))
                 else:
-                    console.print(Panel(f"No changes could be applied in attempt {attempt + 1}. Retrying...", style="yellow"))
-            else:
-                return f"No changes suggested for {path}"
-        
-        return f"Failed to apply changes to {path} after {max_retries} attempts."
-    except Exception as e:
-        return f"Error editing/applying to file: {str(e)}"
+                    results.append(f"No changes suggested for {path}")
+                    break
+
+            if attempt == max_retries - 1:
+                results.append(f"Failed to apply changes to {path} after {max_retries} attempts.")
+        except Exception as e:
+            error_message = f"Error editing/applying to file {path}: {str(e)}"
+            results.append(error_message)
+            console_outputs.append(error_message)
+
+    return "\n".join(results), "\n".join(console_outputs)
 
 
 
@@ -423,6 +476,7 @@ async def apply_edits(file_path, edit_instructions, original_content):
     edited_content = original_content
     total_edits = len(edit_instructions)
     failed_edits = []
+    console_output = []
 
     with Progress(
         SpinnerColumn(),
@@ -436,37 +490,62 @@ async def apply_edits(file_path, edit_instructions, original_content):
         for i, edit in enumerate(edit_instructions, 1):
             search_content = edit['search'].strip()
             replace_content = edit['replace'].strip()
-            
+            similarity = edit['similarity']
+
             # Use regex to find the content, ignoring leading/trailing whitespace
             pattern = re.compile(re.escape(search_content), re.DOTALL)
             match = pattern.search(edited_content)
             
-            if match:
-                # Replace the content, preserving the original whitespace
-                start, end = match.span()
-                # Strip <SEARCH> and <REPLACE> tags from replace_content
-                replace_content_cleaned = re.sub(r'</?SEARCH>|</?REPLACE>', '', replace_content)
-                edited_content = edited_content[:start] + replace_content_cleaned + edited_content[end:]
-                changes_made = True
-                
-                # Display the diff for this edit
-                diff_result = generate_diff(search_content, replace_content, file_path)
-                console.print(Panel(diff_result, title=f"Changes in {file_path} ({i}/{total_edits})", style="cyan"))
+            if match or (USE_FUZZY_SEARCH and similarity >= 0.8):
+                if not match:
+                    # If using fuzzy search and no exact match, find the best match
+                    best_match = difflib.get_close_matches(search_content, [edited_content], n=1, cutoff=0.6)
+                    if best_match:
+                        match = re.search(re.escape(best_match[0]), edited_content)
+
+                if match:
+                    # Replace the content, preserving the original whitespace
+                    start, end = match.span()
+                    # Strip <SEARCH> and <REPLACE> tags from replace_content
+                    replace_content_cleaned = re.sub(r'</?SEARCH>|</?REPLACE>', '', replace_content)
+                    edited_content = edited_content[:start] + replace_content_cleaned + edited_content[end:]
+                    changes_made = True
+
+                    # Display the diff for this edit
+                    diff_result = generate_diff(search_content, replace_content, file_path)
+                    console.print(Panel(diff_result, title=f"Changes in {file_path} ({i}/{total_edits}) - Similarity: {similarity:.2f}", style="cyan"))
+                    console_output.append(f"Edit {i}/{total_edits} applied successfully")
+                else:
+                    message = f"Edit {i}/{total_edits} not applied: content not found (Similarity: {similarity:.2f})"
+                    console_output.append(message)
+                    console.print(Panel(message, style="yellow"))
+                    failed_edits.append(f"Edit {i}: {search_content}")
             else:
-                console.print(Panel(f"Edit {i}/{total_edits} not applied: content not found", style="yellow"))
+                message = f"Edit {i}/{total_edits} not applied: content not found (Similarity: {similarity:.2f})"
+                console_output.append(message)
+                console.print(Panel(message, style="yellow"))
                 failed_edits.append(f"Edit {i}: {search_content}")
 
             progress.update(edit_task, advance=1)
 
     if not changes_made:
-        console.print(Panel("No changes were applied. The file content already matches the desired state.", style="green"))
+        message = "No changes were applied. The file content already matches the desired state."
+        console_output.append(message)
+        console.print(Panel(message, style="green"))
     else:
         # Write the changes to the file
         with open(file_path, 'w') as file:
             file.write(edited_content)
-        console.print(Panel(f"Changes have been written to {file_path}", style="green"))
+        message = f"Changes have been written to {file_path}"
+        console_output.append(message)
+        console.print(Panel(message, style="green"))
 
-    return edited_content, changes_made, "\n".join(failed_edits)
+    return edited_content, changes_made, "\n".join(failed_edits), "\n".join(console_output)
+
+
+def highlight_diff(diff_text):
+    return Syntax(diff_text, "diff", theme="monokai", line_numbers=True)
+
 
 def generate_diff(original, new, path):
     diff = list(difflib.unified_diff(
@@ -579,57 +658,77 @@ def stop_process(process_id):
 
 tools = [
     {
-        "name": "create_folder",
-        "description": "Create a new folder at the specified path. This tool should be used when you need to create a new directory in the project structure. It will create all necessary parent directories if they don't exist. The tool will return a success message if the folder is created or already exists, and an error message if there's a problem creating the folder.",
+        "name": "create_folders",
+        "description": "Create new folders at the specified paths. This tool should be used when you need to create one or more directories in the project structure. It will create all necessary parent directories if they don't exist.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The absolute or relative path where the folder should be created. Use forward slashes (/) for path separation, even on Windows systems."
+                "paths": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "An array of absolute or relative paths where the folders should be created. Use forward slashes (/) for path separation, even on Windows systems."
                 }
             },
-            "required": ["path"]
+            "required": ["paths"]
         }
     },
     {
-        "name": "create_file",
-        "description": "Create a new file at the specified path with the given content. This tool should be used when you need to create a new file in the project structure. It will create all necessary parent directories if they don't exist. The tool will return a success message if the file is created, and an error message if there's a problem creating the file or if the file already exists. The content should be as complete and useful as possible, including necessary imports, function definitions, and comments.",
+        "name": "create_files",
+        "description": "Create one or more new files with the given contents. This tool should be used when you need to create files in the project structure. It will create all necessary parent directories if they don't exist.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The absolute or relative path where the file should be created. Use forward slashes (/) for path separation, even on Windows systems."
-                },
-                "content": {
-                    "type": "string",
-                    "description": "The content of the file. This should include all necessary code, comments, and formatting."
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "The absolute or relative path where the file should be created. Use forward slashes (/) for path separation, even on Windows systems."
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The content of the file. This should include all necessary code, comments, and formatting."
+                            }
+                        },
+                        "required": ["path", "content"]
+                    }
                 }
-            },
-            "required": ["path", "content"]
+            }
         }
     },
     {
-        "name": "edit_and_apply",
-        "description": "Apply AI-powered improvements to a file based on specific instructions and detailed project context. This function reads the file, processes it in batches using AI with conversation history and comprehensive code-related project context. It generates a diff and allows the user to confirm changes before applying them. The goal is to maintain consistency and prevent breaking connections between files. This tool should be used for complex code modifications that require understanding of the broader project context.",
+        "name": "edit_and_apply_multiple",
+        "description": "Apply AI-powered improvements to multiple files based on specific instructions and detailed project context.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The absolute or relative path of the file to edit. Use forward slashes (/) for path separation, even on Windows systems."
-                },
-                "instructions": {
-                    "type": "string",
-                    "description": "After completing the code review, construct a plan for the change between <PLANNING> tags. Ask for additional source files or documentation that may be relevant. The plan should avoid duplication (DRY principle), and balance maintenance and flexibility. Present trade-offs and implementation choices at this step. Consider available Frameworks and Libraries and suggest their use when relevant. STOP at this step if we have not agreed a plan.\n\nOnce agreed, produce code between <OUTPUT> tags. Pay attention to Variable Names, Identifiers and String Literals, and check that they are reproduced accurately from the original source files unless otherwise directed. When naming by convention surround in double colons and in ::UPPERCASE::. Maintain existing code style, use language appropriate idioms. Produce Code Blocks with the language specified after the first backticks"
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "The absolute or relative path of the file to edit."
+                            },
+                            "instructions": {
+                                "type": "string",
+                                "description": "Specific instructions for editing this file."
+                            }
+                        },
+                        "required": ["path", "instructions"]
+                    }
                 },
                 "project_context": {
                     "type": "string",
-                    "description": "Comprehensive context about the project, including recent changes, new variables or functions, interconnections between files, coding standards, and any other relevant information that might affect the edit."
+                    "description": "Comprehensive context about the project, including recent changes, new variables or functions, interconnections between files, coding standards, and any other relevant information that might affect the edits."
                 }
             },
-            "required": ["path", "instructions", "project_context"]
+            "required": ["files", "project_context"]
         }
     },
     {
@@ -726,18 +825,16 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
     try:
         result = None
         is_error = False
+        console_output = None
 
-        if tool_name == "create_folder":
-            result = create_folder(tool_input["path"])
-        elif tool_name == "create_file":
-            result = create_file(tool_input["path"], tool_input.get("content", ""))
-        elif tool_name == "edit_and_apply":
-            result = await edit_and_apply(
-                tool_input["path"],
-                tool_input["instructions"],
-                tool_input["project_context"],
-                is_automode=automode
-            )
+        if tool_name == "create_files":
+            # Handle both single file and multiple files
+            files = tool_input.get("files", [tool_input])
+            result = create_files(files)
+        elif tool_name == "edit_and_apply_multiple":
+            result, console_output = await edit_and_apply_multiple(tool_input["files"], tool_input["project_context"], is_automode=automode)
+        elif tool_name == "create_folders":
+            result = create_folders(tool_input["paths"])
         elif tool_name == "read_file":
             result = read_file(tool_input["path"])
         elif tool_name == "read_multiple_files":
@@ -761,19 +858,22 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
 
         return {
             "content": result,
-            "is_error": is_error
+            "is_error": is_error,
+            "console_output": console_output
         }
     except KeyError as e:
         logging.error(f"Missing required parameter {str(e)} for tool {tool_name}")
         return {
             "content": f"Error: Missing required parameter {str(e)} for tool {tool_name}",
-            "is_error": True
+            "is_error": True,
+            "console_output": None
         }
     except Exception as e:
         logging.error(f"Error executing tool {tool_name}: {str(e)}")
         return {
             "content": f"Error executing tool {tool_name}: {str(e)}",
-            "is_error": True
+            "is_error": True,
+            "console_output": None
         }
 
 def encode_image_to_base64(image_path):
@@ -815,18 +915,27 @@ async def send_to_ai_for_executing(code, execution_result):
         IMPORTANT: PROVIDE ONLY YOUR ANALYSIS AND OBSERVATIONS. DO NOT INCLUDE ANY PREFACING STATEMENTS OR EXPLANATIONS OF YOUR ROLE.
         """
 
-        response = client.messages.create(
+        response = client.beta.prompt_caching.messages.create(
             model=CODEEXECUTIONMODEL,
             max_tokens=2000,
-            system=system_prompt,
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
             messages=[
                 {"role": "user", "content": f"Analyze this code execution from the 'code_execution_env' virtual environment:\n\nCode:\n{code}\n\nExecution Result:\n{execution_result}"}
-            ]
+            ],
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
         )
 
         # Update token usage for code execution
         code_execution_tokens['input'] += response.usage.input_tokens
         code_execution_tokens['output'] += response.usage.output_tokens
+        code_execution_tokens['cache_creation'] = response.usage.cache_creation_input_tokens
+        code_execution_tokens['cache_read'] = response.usage.cache_read_input_tokens
 
         analysis = response.content[0].text
 
@@ -861,7 +970,7 @@ def save_chat(format):
                 for content in message['content']:
                     if content['type'] == 'tool_result':
                         formatted_chat += f"### Tool Result\n\n```\n{content['content']}\n```\n\n"
-        
+
         # Save to file
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(formatted_chat)
@@ -877,19 +986,19 @@ def load_chat(filename):
     try:
         with open(filename, 'r', encoding='utf-8') as f:
             loaded_data = json.load(f)
-        
+
         # Validate the loaded data structure
         if not isinstance(loaded_data, list) or not all(isinstance(item, dict) for item in loaded_data):
             raise ValueError("Invalid chat file format")
-        
+
         conversation_history = loaded_data
-        
+
         # Reset token counts
         main_model_tokens = {'input': 0, 'output': 0}
         tool_checker_tokens = {'input': 0, 'output': 0}
         code_editor_tokens = {'input': 0, 'output': 0}
         code_execution_tokens = {'input': 0, 'output': 0}
-        
+
         console.print(Panel(f"Chat loaded from {filename}", title="Chat Loaded", style="bold green"))
         console.print(Panel("Token usage information will be recalculated.", title="Recalculation", style="bold yellow"))
         display_token_usage()
@@ -907,7 +1016,6 @@ def load_chat(filename):
 async def chat_with_claude(user_input, image_path=None, current_iteration=None, max_iterations=None):
     global conversation_history, automode, main_model_tokens
 
-    # This function uses MAINMODEL, which maintains context across calls
     current_conversation = []
 
     if image_path:
@@ -964,19 +1072,32 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
     messages = filtered_conversation_history + current_conversation
 
     try:
-        # MAINMODEL call, which maintains context
-        response = client.messages.create(
+        # MAINMODEL call with prompt caching
+        response = client.beta.prompt_caching.messages.create(
             model=MAINMODEL,
             max_tokens=4096,
-            system=update_system_prompt(current_iteration, max_iterations),
-            extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
+            system=[
+                {
+                    "type": "text",
+                    "text": update_system_prompt(current_iteration, max_iterations),
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "type": "text",
+                    "text": json.dumps(tools),
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
             messages=messages,
             tools=tools,
-            tool_choice={"type": "auto"}
+            tool_choice={"type": "auto"},
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
         )
         # Update token usage for MAINMODEL
         main_model_tokens['input'] += response.usage.input_tokens
         main_model_tokens['output'] += response.usage.output_tokens
+        main_model_tokens['cache_creation'] = response.usage.cache_creation_input_tokens
+        main_model_tokens['cache_read'] = response.usage.cache_read_input_tokens
     except APIStatusError as e:
         if e.status_code == 429:
             console.print(Panel("Rate limit exceeded. Retrying after a short delay...", title="API Error", style="bold yellow"))
@@ -1050,14 +1171,23 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
         })
 
         # Update the file_contents dictionary if applicable
-        if tool_name in ['create_file', 'edit_and_apply', 'read_file'] and not tool_result["is_error"]:
-            if 'path' in tool_input:
-                file_path = tool_input['path']
-                if "File contents updated in system prompt" in tool_result["content"] or \
-                   "File created and added to system prompt" in tool_result["content"] or \
-                   "has been read and stored in the system prompt" in tool_result["content"]:
-                    # The file_contents dictionary is already updated in the tool function
+        if tool_name in ['create_files', 'edit_and_apply_multiple', 'read_file', 'read_multiple_files'] and not tool_result["is_error"]:
+            if tool_name == 'create_files':
+                for file in tool_input['files']:
+                    if "File created and added to system prompt" in tool_result["content"]:
+                        file_contents[file['path']] = file['content']
+            elif tool_name == 'edit_and_apply_multiple':
+                for file in tool_input['files']:
+                    if f"Changes applied to {file['path']}" in tool_result["content"]:
+                        # The file_contents dictionary is already updated in the edit_and_apply_multiple function
+                        pass
+            elif tool_name == 'read_file':
+                if "has been read and stored in the system prompt" in tool_result["content"]:
+                    # The file_contents dictionary is already updated in the read_file function
                     pass
+            elif tool_name == 'read_multiple_files':
+                # The file_contents dictionary is already updated in the read_multiple_files function
+                pass
 
         messages = filtered_conversation_history + current_conversation
 
@@ -1124,19 +1254,23 @@ def display_token_usage():
     table.add_column("Model", style="cyan")
     table.add_column("Input", style="magenta")
     table.add_column("Output", style="magenta")
+    table.add_column("Cache Write", style="blue")
+    table.add_column("Cache Read", style="blue")
     table.add_column("Total", style="green")
     table.add_column(f"% of Context ({MAX_CONTEXT_TOKENS:,})", style="yellow")
     table.add_column("Cost ($)", style="red")
 
     model_costs = {
-        "Main Model": {"input": 3.00, "output": 15.00, "has_context": True},
-        "Tool Checker": {"input": 3.00, "output": 15.00, "has_context": False},
-        "Code Editor": {"input": 3.00, "output": 15.00, "has_context": True},
-        "Code Execution": {"input": 3.00, "output": 15.00, "has_context": False}
+        "Main Model": {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30, "has_context": True},
+        "Tool Checker": {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30, "has_context": False},
+        "Code Editor": {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30, "has_context": True},
+        "Code Execution": {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30, "has_context": False}
     }
 
     total_input = 0
     total_output = 0
+    total_cache_write = 0
+    total_cache_read = 0
     total_cost = 0
     total_context_tokens = 0
 
@@ -1146,14 +1280,20 @@ def display_token_usage():
                           ("Code Execution", code_execution_tokens)]:
         input_tokens = tokens['input']
         output_tokens = tokens['output']
-        total_tokens = input_tokens + output_tokens
+        cache_write_tokens = tokens.get('cache_creation', 0)
+        cache_read_tokens = tokens.get('cache_read', 0)
+        total_tokens = input_tokens + output_tokens + cache_write_tokens + cache_read_tokens
 
         total_input += input_tokens
         total_output += output_tokens
+        total_cache_write += cache_write_tokens
+        total_cache_read += cache_read_tokens
 
         input_cost = (input_tokens / 1_000_000) * model_costs[model]["input"]
         output_cost = (output_tokens / 1_000_000) * model_costs[model]["output"]
-        model_cost = input_cost + output_cost
+        cache_write_cost = (cache_write_tokens / 1_000_000) * model_costs[model]["cache_write"]
+        cache_read_cost = (cache_read_tokens / 1_000_000) * model_costs[model]["cache_read"]
+        model_cost = input_cost + output_cost + cache_write_cost + cache_read_cost
         total_cost += model_cost
 
         if model_costs[model]["has_context"]:
@@ -1166,20 +1306,24 @@ def display_token_usage():
             model,
             f"{input_tokens:,}",
             f"{output_tokens:,}",
+            f"{cache_write_tokens:,}",
+            f"{cache_read_tokens:,}",
             f"{total_tokens:,}",
             f"{percentage:.2f}%" if model_costs[model]["has_context"] else "Doesn't save context",
             f"${model_cost:.3f}"
         )
 
-    grand_total = total_input + total_output
+    grand_total = total_input + total_output + total_cache_write + total_cache_read
     total_percentage = (total_context_tokens / MAX_CONTEXT_TOKENS) * 100
 
     table.add_row(
         "Total",
         f"{total_input:,}",
         f"{total_output:,}",
+        f"{total_cache_write:,}",
+        f"{total_cache_read:,}",
         f"{grand_total:,}",
-        "",  # Empty string for the "% of Context" column
+        f"{total_percentage:.2f}%",
         f"${total_cost:.3f}",
         style="bold"
     )
